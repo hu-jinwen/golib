@@ -16,6 +16,7 @@ package net
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -33,13 +34,9 @@ type ProxyAuth struct {
 	Passwd   string
 }
 
-func DialTcpByProxy(proxyStr string, addr string) (c net.Conn, err error) {
-	if proxyStr == "" {
-		return net.Dial("tcp", addr)
-	}
-
+func (d *Dialer) dialTcpByProxy(ctx context.Context, addr string) (c net.Conn, err error) {
 	var proxyUrl *url.URL
-	if proxyUrl, err = url.Parse(proxyStr); err != nil {
+	if proxyUrl, err = url.Parse(d.op.proxyURL); err != nil {
 		return
 	}
 
@@ -52,18 +49,19 @@ func DialTcpByProxy(proxyStr string, addr string) (c net.Conn, err error) {
 
 	switch proxyUrl.Scheme {
 	case "http":
-		return DialTcpByHttpProxy(proxyUrl.Host, addr, auth)
+		return d.dialTcpByHttpProxy(ctx, proxyUrl.Host, addr, auth)
 	case "ntlm":
-		return DialTcpByNTLMHttpProxy(proxyUrl.Host, addr, auth)
+		return d.dialTcpByNTLMHttpProxy(ctx, proxyUrl.Host, addr, auth)
 	case "socks5":
-		return DialTcpBySocks5Proxy(proxyUrl.Host, addr, auth)
+		return d.dialTcpBySocks5Proxy(ctx, proxyUrl.Host, addr, auth)
 	default:
 		err = fmt.Errorf("Proxy URL scheme must be http or socks5 or ntlm, not [%s]", proxyUrl.Scheme)
 		return
 	}
 }
-func DialTcpByNTLMHttpProxy(proxyHost string, dstAddr string, auth *ProxyAuth) (c net.Conn, err error) {
-	if c, err = net.Dial("tcp", proxyHost); err != nil {
+
+func (d *Dialer) dialTcpByNTLMHttpProxy(ctx context.Context, proxyHost string, dstAddr string, auth *ProxyAuth) (c net.Conn, err error) {
+	if c, err = d.dialer.DialContext(ctx, "tcp", proxyHost); err != nil {
 		return
 	}
 
@@ -118,8 +116,9 @@ func DialTcpByNTLMHttpProxy(proxyHost string, dstAddr string, auth *ProxyAuth) (
 	}
 	return
 }
-func DialTcpByHttpProxy(proxyHost string, dstAddr string, auth *ProxyAuth) (c net.Conn, err error) {
-	if c, err = net.Dial("tcp", proxyHost); err != nil {
+
+func (d *Dialer) dialTcpByHttpProxy(ctx context.Context, proxyHost string, dstAddr string, auth *ProxyAuth) (c net.Conn, err error) {
+	if c, err = d.dialer.DialContext(ctx, "tcp", proxyHost); err != nil {
 		return
 	}
 
@@ -145,7 +144,7 @@ func DialTcpByHttpProxy(proxyHost string, dstAddr string, auth *ProxyAuth) (c ne
 	return
 }
 
-func DialTcpBySocks5Proxy(proxyHost string, dstAddr string, auth *ProxyAuth) (c net.Conn, err error) {
+func (d *Dialer) dialTcpBySocks5Proxy(ctx context.Context, proxyHost string, dstAddr string, auth *ProxyAuth) (c net.Conn, err error) {
 	var s5Auth *proxy.Auth
 	if auth.Enable {
 		s5Auth = &proxy.Auth{
@@ -154,7 +153,10 @@ func DialTcpBySocks5Proxy(proxyHost string, dstAddr string, auth *ProxyAuth) (c 
 		}
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", proxyHost, s5Auth, nil)
+	dialer, err := proxy.SOCKS5("tcp", proxyHost, s5Auth, newFundialContext(func(_ context.Context, network string, addr string) (net.Conn, error) {
+		return d.dialer.DialContext(ctx, "tcp", addr)
+	}))
+
 	if err != nil {
 		return nil, err
 	}
@@ -163,4 +165,22 @@ func DialTcpBySocks5Proxy(proxyHost string, dstAddr string, auth *ProxyAuth) (c 
 		return
 	}
 	return
+}
+
+type fundialContext struct {
+	f func(ctx context.Context, networkd string, addr string) (c net.Conn, err error)
+}
+
+func newFundialContext(f func(ctx context.Context, networkd string, addr string) (c net.Conn, err error)) *fundialContext {
+	return &fundialContext{
+		f: f,
+	}
+}
+
+func (fdc *fundialContext) DialContext(ctx context.Context, network string, addr string) (c net.Conn, err error) {
+	return fdc.f(ctx, network, addr)
+}
+
+func (fdc *fundialContext) Dial(network string, addr string) (c net.Conn, err error) {
+	return fdc.DialContext(context.Background(), network, addr)
 }
