@@ -23,58 +23,68 @@ import (
 	"github.com/fatedier/kcp-go"
 )
 
-func DialWithOptions(addr string, opts ...DialOption) (c net.Conn, err error) {
-	return DialContextWithOptions(context.Background(), addr, opts...)
+func Dial(addr string, opts ...DialOption) (c net.Conn, err error) {
+	return DialContext(context.Background(), addr, opts...)
 }
 
-func DialContextWithOptions(ctx context.Context, addr string, opts ...DialOption) (c net.Conn, err error) {
+func DialContext(ctx context.Context, addr string, opts ...DialOption) (c net.Conn, err error) {
 	op := defaultDialOptions()
 
 	for _, opt := range opts {
 		opt.apply(&op)
 	}
 
-	switch op.proxyScheme {
-	case "socks5":
-		op.dialAfterHook = append(op.dialAfterHook, newSocks5DialAfterHook(addr, op))
-	case "http":
-		op.dialAfterHook = append(op.dialAfterHook, newHTTPProxyAfterHook(addr, op))
-	case "ntlm":
-		op.dialAfterHook = append(op.dialAfterHook, newNTLMHTTPProxyAfterHook(addr, op))
+	// call before dial hooks
+	dialMetas := make(DialMetas)
+	ctx = context.WithValue(ctx, ctxKey, dialMetas)
+
+	for _, v := range op.beforeHooks {
+		ctx = v.Hook(ctx, addr)
 	}
 
-	if op.websocketPath != "" {
-		op.dialAfterHook = append(op.dialAfterHook, newWebsocketAfterHook(addr, op))
-	}
-	if op.tlsConfig != nil {
-		op.dialAfterHook = append(op.dialAfterHook, newTLSDialAfterHook(addr, op))
-	}
-
-	// dial real connection
-	if op.dialer != nil {
-		c, err = op.dialer(ctx, addr)
-	} else {
-		if op.proxyURL != "" {
-			addr = op.proxyAddr
+	if op.proxyAddr != "" {
+		support := false
+		for _, v := range supportProxyTypes {
+			if op.proxyType == v {
+				support = true
+				break
+			}
 		}
-		c, err = dial(ctx, addr, op)
+		if !support {
+			return nil, fmt.Errorf("ProxyType must be http or socks5 or ntlm, not [%s]", op.proxyType)
+		}
 	}
 
+	// dial a new connection
+	dstAddr := addr
+	if op.proxyAddr != "" {
+		dstAddr = op.proxyAddr
+	}
+
+	if op.dialer != nil {
+		c, err = op.dialer(ctx, dstAddr)
+	} else {
+		c, err = dial(ctx, dstAddr, op)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	sort.Slice(op.dialAfterHook, func(i, j int) bool {
-		return op.dialAfterHook[i].Priority < op.dialAfterHook[j].Priority
+	// call after dial hooks
+	sort.SliceStable(op.afterHooks, func(i, j int) bool {
+		return op.afterHooks[i].Priority < op.afterHooks[j].Priority
 	})
 
-	for _, hook := range op.dialAfterHook {
-		c, err = hook.Hook(c)
+	lastSuccConn := c
+	for _, v := range op.afterHooks {
+		ctx, c, err = v.Hook(ctx, c, addr)
 		if err != nil {
+			// Close last valid connection if any error occured
+			lastSuccConn.Close()
 			return nil, err
 		}
+		lastSuccConn = c
 	}
-
 	return
 }
 
@@ -82,9 +92,11 @@ func dial(ctx context.Context, addr string, op dialOptions) (c net.Conn, err err
 	switch op.protocol {
 	case "tcp":
 		dialer := &net.Dialer{}
-		if tcpAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%v:0", op.laddr)); err == nil {
-			dialer = &net.Dialer{
-				LocalAddr: tcpAddr,
+		if op.laddr != "" {
+			if tcpAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:", op.laddr)); err == nil {
+				dialer = &net.Dialer{
+					LocalAddr: tcpAddr,
+				}
 			}
 		}
 		return dialer.DialContext(ctx, "tcp", addr)

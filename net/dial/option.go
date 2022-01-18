@@ -23,83 +23,72 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/Azure/go-ntlmssp"
 	"golang.org/x/net/proxy"
-	"golang.org/x/net/websocket"
 )
 
+var (
+	supportProxyTypes = []string{"socks5", "http", "ntlm"}
+)
+
+type ProxyAuth struct {
+	Username string
+	Passwd   string
+}
+
+type DialMetas map[interface{}]interface{}
+
+func (m DialMetas) Value(key interface{}) interface{} {
+	return m[key]
+}
+
+type metaKey string
+
+const (
+	ctxKey       metaKey = "meta"
+	proxyAuthKey metaKey = "proxyAuth"
+)
+
+func GetDialMetasFromContext(ctx context.Context) DialMetas {
+	metas, ok := ctx.Value(ctxKey).(DialMetas)
+	if !ok || metas == nil {
+		metas = make(DialMetas)
+	}
+	return metas
+}
+
 type dialOptions struct {
-	proxyURL string
-
-	proxyScheme string
-	proxyAddr   string // if proxyURL not empty, proxyAddr will be generate
-	proxyAuth   *ProxyAuth
-
-	protocol string
-
+	proxyType string
+	proxyAddr string
+	protocol  string
 	tlsConfig *tls.Config
-
-	websocketPath string
-
-	laddr string // only use ip, port is random
+	laddr     string // only use ip, port is random
 
 	dialer func(ctx context.Context, addr string) (c net.Conn, err error)
 
-	dialAfterHook  []dialHook
-	dialBeforeHook []dialHook
+	afterHooks  []AfterHook
+	beforeHooks []BeforeHook
 }
 
-type dialHook struct {
-	Priority uint // smaller value will be executed first
-	Hook     func(c net.Conn) (net.Conn, error)
+type BeforeHookFunc func(ctx context.Context, addr string) context.Context
+
+type BeforeHook struct {
+	Hook BeforeHookFunc
 }
 
-func newWebsocketAfterHook(addr string, op dialOptions) dialHook {
-	return dialHook{
-		Priority: 1,
-		Hook: func(c net.Conn) (net.Conn, error) {
-			return websocketHook(c, addr, op)
-		},
-	}
-}
+const (
+	DefaultAfterHookPriority = 10
+)
 
-func newSocks5DialAfterHook(addr string, op dialOptions) dialHook {
-	return dialHook{
-		Priority: 1,
-		Hook: func(c net.Conn) (net.Conn, error) {
-			return socks5Hook(c, addr, op)
-		},
-	}
-}
+type AfterHookFunc func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error)
 
-func newHTTPProxyAfterHook(addr string, op dialOptions) dialHook {
-	return dialHook{
-		Priority: 1,
-		Hook: func(c net.Conn) (net.Conn, error) {
-			return httpProxyHook(c, addr, op)
-		},
-	}
-}
-
-func newNTLMHTTPProxyAfterHook(addr string, op dialOptions) dialHook {
-	return dialHook{
-		Priority: 1,
-		Hook: func(c net.Conn) (net.Conn, error) {
-			return ntlmHTTPProxyHook(c, addr, op)
-		},
-	}
-}
-
-func newTLSDialAfterHook(addr string, op dialOptions) dialHook {
-	return dialHook{
-		Priority: math.MaxInt32,
-		Hook: func(c net.Conn) (net.Conn, error) {
-			return tlsHook(c, op)
-		},
-	}
+type AfterHook struct {
+	// smaller value will be called first, 0 is reserverd for private use.
+	// If caller set this 0, use DefaultAfterHookPriority instead.
+	Priority uint64
+	Hook     AfterHookFunc
 }
 
 type DialOption interface {
@@ -126,33 +115,68 @@ func defaultDialOptions() dialOptions {
 	}
 }
 
-func WithProxyURL(proxyURL string) DialOption {
+func WithProxy(proxyType string, address string) DialOption {
 	return newFuncDialOption(func(do *dialOptions) {
-		var proxyUrl *url.URL
-		var err error
-
-		if proxyUrl, err = url.Parse(proxyURL); err != nil {
+		if proxyType == "" && address == "" {
 			return
 		}
 
-		auth := &ProxyAuth{}
-		if proxyUrl.User != nil {
-			auth.Enable = true
-			auth.Username = proxyUrl.User.Username()
-			auth.Passwd, _ = proxyUrl.User.Password()
+		do.proxyType = proxyType
+		do.proxyAddr = address
+
+		var hook func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error)
+		switch proxyType {
+		case "socks5":
+			hook = func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
+				conn, err := socks5ProxyAfterHook(ctx, c, addr)
+				return ctx, conn, err
+			}
+		case "http":
+			hook = func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
+				conn, err := httpProxyAfterHook(ctx, c, addr)
+				return ctx, conn, err
+			}
+		case "ntlm":
+			hook = func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
+				conn, err := ntlmHTTPProxyAfterHook(ctx, c, addr)
+				return ctx, conn, err
+			}
 		}
 
-		do.proxyScheme = proxyUrl.Scheme
-		do.proxyAddr = proxyUrl.Host
-		do.proxyAuth = auth
+		if hook != nil {
+			do.afterHooks = append(do.afterHooks, AfterHook{
+				Priority: 0,
+				Hook:     hook,
+			})
+		}
+	})
+}
 
-		do.proxyURL = proxyURL
+func WithProxyAuth(auth *ProxyAuth) DialOption {
+	return newFuncDialOption(func(do *dialOptions) {
+		do.beforeHooks = append(do.beforeHooks, BeforeHook{
+			Hook: func(ctx context.Context, addr string) context.Context {
+				metas := GetDialMetasFromContext(ctx)
+				metas[proxyAuthKey] = auth
+				return ctx
+			},
+		})
 	})
 }
 
 func WithTLSConfig(tlsConfig *tls.Config) DialOption {
 	return newFuncDialOption(func(do *dialOptions) {
-		do.tlsConfig = tlsConfig
+		if tlsConfig == nil {
+			return
+		}
+
+		do.afterHooks = append(do.afterHooks, AfterHook{
+			Priority: math.MaxUint64,
+			Hook: func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
+				conn, err := tlsAfterHook(c, tlsConfig)
+				return ctx, conn, err
+			},
+		})
 	})
 }
 
@@ -168,16 +192,30 @@ func WithLocalAddr(laddr string) DialOption {
 	})
 }
 
-func WithWebSocketPath(websocketPath string) DialOption {
+func WithAfterHook(hook AfterHook) DialOption {
 	return newFuncDialOption(func(do *dialOptions) {
-		do.websocketPath = websocketPath
+		do.afterHooks = append(do.afterHooks, hook)
 	})
 }
 
-type ProxyAuth struct {
-	Enable   bool
-	Username string
-	Passwd   string
+func newSocks5ProxyAfterHook(addr string, op dialOptions) AfterHook {
+	return AfterHook{
+		Priority: 0,
+		Hook: func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
+			conn, err := socks5ProxyAfterHook(ctx, c, addr)
+			return ctx, conn, err
+		},
+	}
+}
+
+func newNTLMHTTPProxyAfterHook(addr string, op dialOptions) AfterHook {
+	return AfterHook{
+		Priority: 0,
+		Hook: func(ctx context.Context, c net.Conn, addr string) (context.Context, net.Conn, error) {
+			conn, err := ntlmHTTPProxyAfterHook(ctx, c, addr)
+			return ctx, conn, err
+		},
+	}
 }
 
 type funcDialContext func(ctx context.Context, networkd string, addr string) (c net.Conn, err error)
@@ -190,60 +228,43 @@ func (fdc funcDialContext) Dial(network string, addr string) (c net.Conn, err er
 	return fdc(context.Background(), network, addr)
 }
 
-func websocketHook(conn net.Conn, addr string, op dialOptions) (net.Conn, error) {
-	addr = "ws://" + addr + op.websocketPath
-	uri, err := url.Parse(addr)
-	if err != nil {
-		return nil, err
-	}
+func socks5ProxyAfterHook(ctx context.Context, conn net.Conn, addr string) (net.Conn, error) {
+	meta := GetDialMetasFromContext(ctx)
+	proxyAuth, _ := meta.Value(proxyAuthKey).(*ProxyAuth)
 
-	origin := "http://" + uri.Host
-	cfg, err := websocket.NewConfig(addr, origin)
-	if err != nil {
-		return nil, err
-	}
-
-	return websocket.NewClient(cfg, conn)
-}
-
-func socks5Hook(conn net.Conn, addr string, op dialOptions) (c net.Conn, err error) {
 	var s5Auth *proxy.Auth
-	if op.proxyAuth.Enable {
+	if proxyAuth != nil {
 		s5Auth = &proxy.Auth{
-			User:     op.proxyAuth.Username,
-			Password: op.proxyAuth.Passwd,
+			User:     proxyAuth.Username,
+			Password: proxyAuth.Passwd,
 		}
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", op.proxyAddr, s5Auth, funcDialContext(func(_ context.Context, network string, addr string) (net.Conn, error) {
-		// always return an exist connection
+	// We don't use address here because we always return an existing connection and ignore it
+	dialer, err := proxy.SOCKS5("tcp", "", s5Auth, funcDialContext(func(_ context.Context, network string, addr string) (net.Conn, error) {
 		return conn, nil
 	}))
-
 	if err != nil {
 		return nil, err
 	}
 
-	if c, err = dialer.Dial("tcp", addr); err != nil {
-		return
+	c, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
 	}
-	return
+	return c, nil
 }
 
-func tlsHook(conn net.Conn, op dialOptions) (net.Conn, error) {
-	if op.tlsConfig == nil {
-		return conn, nil
-	}
-	return tls.Client(conn, op.tlsConfig), nil
-}
+func httpProxyAfterHook(ctx context.Context, conn net.Conn, addr string) (net.Conn, error) {
+	meta := GetDialMetasFromContext(ctx)
+	proxyAuth, _ := meta.Value(proxyAuthKey).(*ProxyAuth)
 
-func httpProxyHook(conn net.Conn, addr string, op dialOptions) (net.Conn, error) {
 	req, err := http.NewRequest("CONNECT", "http://"+addr, nil)
 	if err != nil {
 		return nil, err
 	}
-	if op.proxyAuth.Enable {
-		req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(op.proxyAuth.Username+":"+op.proxyAuth.Passwd)))
+	if proxyAuth != nil {
+		req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(proxyAuth.Username+":"+proxyAuth.Passwd)))
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	req.Write(conn)
@@ -260,14 +281,17 @@ func httpProxyHook(conn net.Conn, addr string, op dialOptions) (net.Conn, error)
 	return conn, nil
 }
 
-func ntlmHTTPProxyHook(conn net.Conn, addr string, op dialOptions) (net.Conn, error) {
+func ntlmHTTPProxyAfterHook(ctx context.Context, conn net.Conn, addr string) (net.Conn, error) {
+	meta := GetDialMetasFromContext(ctx)
+	proxyAuth, _ := meta.Value(proxyAuthKey).(*ProxyAuth)
+
 	req, err := http.NewRequest("CONNECT", "http://"+addr, nil)
 	if err != nil {
 		return nil, err
 	}
-	if op.proxyAuth.Enable {
+	if proxyAuth != nil {
 		domain := ""
-		_, domain = ntlmssp.GetDomain(op.proxyAuth.Username)
+		_, domain = ntlmssp.GetDomain(proxyAuth.Username)
 		negotiateMessage, err := ntlmssp.NewNegotiateMessage(domain, "")
 		if err != nil {
 			return nil, err
@@ -282,16 +306,16 @@ func ntlmHTTPProxyHook(conn net.Conn, addr string, op dialOptions) (net.Conn, er
 	}
 	resp.Body.Close()
 
-	if op.proxyAuth.Enable && resp.StatusCode == 407 {
+	if proxyAuth != nil && resp.StatusCode == 407 {
 		challenge := resp.Header.Get("Proxy-Authenticate")
-		username, _ := ntlmssp.GetDomain(op.proxyAuth.Username)
+		username, _ := ntlmssp.GetDomain(proxyAuth.Username)
 
 		if strings.HasPrefix(challenge, "Negotiate ") {
 			challengeMessage, err := base64.StdEncoding.DecodeString(challenge[len("Negotiate "):])
 			if err != nil {
 				return nil, err
 			}
-			authenticateMessage, err := ntlmssp.ProcessChallenge(challengeMessage, username, op.proxyAuth.Passwd)
+			authenticateMessage, err := ntlmssp.ProcessChallenge(challengeMessage, username, proxyAuth.Passwd)
 			if err != nil {
 				return nil, err
 			}
@@ -314,4 +338,11 @@ func ntlmHTTPProxyHook(conn net.Conn, addr string, op dialOptions) (net.Conn, er
 	}
 
 	return conn, nil
+}
+
+func tlsAfterHook(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
+	if tlsConfig == nil {
+		return conn, nil
+	}
+	return tls.Client(conn, tlsConfig), nil
 }
